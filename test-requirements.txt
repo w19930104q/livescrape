@@ -2,5 +2,4 @@ pep8
 flake8
 hacking
 coverage
-unittest2
 responses

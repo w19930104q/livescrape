@@ -1,8 +1,8 @@
 import datetime
 import re
+import unittest
 
 import responses
-import unittest2 as unittest
 
 import livescrape
 
@@ -11,28 +11,40 @@ class BasePage(livescrape.ScrapedPage):
     scrape_url = "http://fake-host/test.html"
 
 
-class Test(unittest.TestCase):
+DEFAULT_HTML = """<html><body>
+<h1 class="foo" data-foo=1>Heading</h1>
+<h1 id="the-id">15</h1>
+<span class=float>3.14</span>
+<span class=int>42</span>
+<span class=bool></span>
+<span class=date>2016-04-23</span>
+<a href="/very-fake">link</a>
+<table>
+  <tr>test123
+    <th>key</th> testmore
+    <td>value</th></tr>
+  <tr><th>key2<td>value2</tr>
+</table
+"""
+
+
+class ResponsesTestCase(unittest.TestCase):
     def setUp(self):
         responses.reset()
-        responses.add(
-            responses.GET, BasePage.scrape_url,
-            """<html><body>
-            <h1 class="foo" data-foo=1>Heading</h1>
-            <h1 id="the-id">15</h1>
-            <span class=float>3.14</span>
-            <span class=int>42</span>
-            <span class=bool></span>
-            <span class=date>2016-04-23</span>
-            <a href="/very-fake">link</a>
-            <table>
-              <tr>test123
-                <th>key</th> testmore
-                <td>value</th></tr>
-              <tr><th>key2<td>value2</tr>
-            </table
-            """)
         responses.start()
         self.addCleanup(responses.stop)
+        self.addCleanup(responses.reset)
+
+    def add_default_page(self, **kwargs):
+        kwargs.setdefault("content_type", "text/html; charset=utf-8")
+        responses.add(responses.GET, BasePage.scrape_url,
+                      DEFAULT_HTML, **kwargs)
+
+
+class Test(ResponsesTestCase):
+    def setUp(self):
+        super(Test, self).setUp()
+        self.add_default_page()
 
     def test_simplecss(self):
         class Page(BasePage):
@@ -352,6 +364,205 @@ class Test(unittest.TestCase):
 
         self.assertEqual(len(responses.calls), 2)
         self.assertNotIn("Referer", responses.calls[1].request.headers)
+
+
+class SnapshotTest(ResponsesTestCase):
+    def test_snapshot_shared_between_fields(self):
+        self.add_default_page()
+
+        class Page(BasePage):
+            foo = livescrape.Css("h1.foo")
+            num = livescrape.CssInt(".int")
+
+        x = Page()
+        self.assertEqual(x.foo, "Heading")
+        self.assertEqual(x.num, 42)
+
+        # A single fetch serves all fields of the object
+        self.assertEqual(len(responses.calls), 1)
+
+        snapshot = x.scrape_snapshot
+        self.assertTrue(snapshot.ok)
+        self.assertIsNone(snapshot.error)
+        self.assertEqual(snapshot.status_code, 200)
+        self.assertEqual(snapshot.url, BasePage.scrape_url)
+        self.assertEqual(snapshot.final_url, BasePage.scrape_url)
+        self.assertEqual(snapshot.encoding.lower(), "utf-8")
+        self.assertIn("Heading", snapshot.text)
+        self.assertIsNotNone(snapshot.document)
+
+    def test_snapshot_final_url_after_redirect(self):
+        responses.add(responses.GET, BasePage.scrape_url,
+                      status=302,
+                      headers={"Location": "http://fake-host/landing.html"})
+        responses.add(responses.GET, "http://fake-host/landing.html",
+                      DEFAULT_HTML,
+                      content_type="text/html; charset=utf-8")
+
+        class Page(BasePage):
+            foo = livescrape.Css("h1.foo")
+
+        x = Page()
+        self.assertEqual(x.foo, "Heading")
+        self.assertEqual(x.scrape_snapshot.final_url,
+                         "http://fake-host/landing.html")
+
+    def test_legacy_html(self):
+        # Pre-HTML5 markup: unclosed tags, font tags, bare entities
+        responses.add(responses.GET, BasePage.scrape_url, """<html>
+<head><title>Legacy page</title>
+<body bgcolor=white>
+<font size=3 class=banner>Legacy &amp; font</font>
+<p>Unclosed paragraph
+<table><tr><td class=cell>cell value</table>
+</html>""", content_type="text/html; charset=utf-8")
+
+        class Page(BasePage):
+            banner = livescrape.Css("font.banner")
+            cell = livescrape.Css("td.cell")
+
+        x = Page()
+        self.assertEqual(x.banner, "Legacy & font")
+        self.assertEqual(x.cell, "cell value")
+        self.assertTrue(x.scrape_snapshot.ok)
+
+    def test_non_200(self):
+        responses.add(responses.GET, BasePage.scrape_url,
+                      "<html><body><h1 class=foo>oops</h1>",
+                      status=503)
+
+        class Page(BasePage):
+            foo = livescrape.Css("h1.foo")
+
+        x = Page()
+
+        with self.assertRaises(livescrape.ScrapeError) as ctx:
+            x.foo
+
+        # The failure carries the full snapshot
+        snapshot = ctx.exception.snapshot
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.status_code, 503)
+        self.assertFalse(snapshot.ok)
+        self.assertIs(x.scrape_snapshot, snapshot)
+
+        # Every field sees the same failure, no extra requests
+        with self.assertRaises(livescrape.ScrapeError):
+            x.foo
+        self.assertEqual(len(responses.calls), 1)
+
+    def test_non_200_allowed(self):
+        responses.add(responses.GET, BasePage.scrape_url,
+                      "<html><body><h1 class=foo>oops</h1>",
+                      status=404)
+
+        class Page(BasePage):
+            scrape_raise_for_status = False
+            foo = livescrape.Css("h1.foo")
+
+        x = Page()
+        self.assertEqual(x.foo, "oops")
+        self.assertEqual(x.scrape_snapshot.status_code, 404)
+
+    def test_bad_encoding(self):
+        # UTF-8 bytes, but the server declares iso-8859-1
+        body = ("<html><body><h1 class=foo>Grüße</h1></body></html>"
+                .encode("utf-8"))
+        responses.add(responses.GET, BasePage.scrape_url, body,
+                      content_type="text/html; charset=iso-8859-1")
+
+        class Page(BasePage):
+            foo = livescrape.Css("h1.foo")
+
+        x = Page()
+        snapshot = x.scrape_snapshot
+
+        # The declared (wrong) encoding is recorded on the snapshot...
+        self.assertEqual(snapshot.encoding.lower(), "iso-8859-1")
+        self.assertNotIn("Grüße", snapshot.text)
+
+        # ...and the raw content is available to recover the real text
+        self.assertIn("Grüße", snapshot.text_as("utf-8"))
+        self.assertIn("Grüße", snapshot.content.decode("utf-8"))
+
+    def test_parse_failure(self):
+        # An empty body cannot be parsed by lxml
+        responses.add(responses.GET, BasePage.scrape_url, "")
+
+        class Page(BasePage):
+            foo = livescrape.Css("h1.foo")
+
+        x = Page()
+
+        with self.assertRaises(livescrape.ScrapeError) as ctx:
+            x.foo
+
+        snapshot = ctx.exception.snapshot
+        self.assertIsNotNone(snapshot.error)
+        self.assertFalse(snapshot.ok)
+        self.assertIsNone(snapshot.document)
+
+    def test_consecutive_retries(self):
+        responses.add(responses.GET, BasePage.scrape_url, status=500)
+        responses.add(responses.GET, BasePage.scrape_url, status=500)
+        responses.add(responses.GET, BasePage.scrape_url, DEFAULT_HTML,
+                      content_type="text/html; charset=utf-8")
+
+        class Page(BasePage):
+            foo = livescrape.Css("h1.foo")
+
+        x = Page()
+
+        with self.assertRaises(livescrape.ScrapeError):
+            x.foo
+
+        snapshot = x.scrape_retry()
+        self.assertFalse(snapshot.ok)
+        self.assertEqual(snapshot.status_code, 500)
+        with self.assertRaises(livescrape.ScrapeError):
+            x.foo
+
+        snapshot = x.scrape_retry()
+        self.assertTrue(snapshot.ok)
+        self.assertEqual(x.foo, "Heading")
+
+        self.assertEqual(len(responses.calls), 3)
+
+    def test_retry_after_parse_failure(self):
+        responses.add(responses.GET, BasePage.scrape_url, "")
+        responses.add(responses.GET, BasePage.scrape_url, DEFAULT_HTML,
+                      content_type="text/html; charset=utf-8")
+
+        class Page(BasePage):
+            foo = livescrape.Css("h1.foo")
+
+        x = Page()
+        with self.assertRaises(livescrape.ScrapeError):
+            x.foo
+
+        self.assertTrue(x.scrape_retry().ok)
+        self.assertEqual(x.foo, "Heading")
+
+    def test_sessions_do_not_leak_cookies(self):
+        responses.add(responses.GET, BasePage.scrape_url, DEFAULT_HTML,
+                      headers={"Set-Cookie": "sessionid=abc123"})
+        responses.add(responses.GET, BasePage.scrape_url, DEFAULT_HTML)
+
+        class Page(BasePage):
+            foo = livescrape.Css("h1.foo")
+
+        first = Page()
+        self.assertEqual(first.foo, "Heading")
+        # The first page's own session picked up the cookie
+        self.assertEqual(first.scrape_session.cookies["sessionid"],
+                         "abc123")
+
+        second = Page()
+        self.assertEqual(second.foo, "Heading")
+
+        self.assertEqual(len(responses.calls), 2)
+        self.assertNotIn("Cookie", responses.calls[1].request.headers)
+
 
 if __name__ == '__main__':
     unittest.main()

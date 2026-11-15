@@ -1,20 +1,72 @@
 from abc import abstractmethod
-import cgi
 import datetime
-try:
-    import urlparse  # python2
-except ImportError:  # pragma: no cover
-    import urllib.parse as urlparse
+from html import escape
+from urllib import parse as urlparse
 import warnings
 
 import lxml.etree
 import lxml.html
 import requests
-import six
 
 
-SHARED_SESSION = requests.Session()
-SHARED_SESSION.headers['User-Agent'] = "Mozilla/5.0 (Livescrape)"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Livescrape)"
+
+
+class ScrapeError(Exception):
+    """Raised when a page could not be retrieved or parsed.
+
+    The ``snapshot`` attribute holds the :class:`PageSnapshot` that caused
+    the failure, so callers can inspect the HTTP status, final url,
+    encoding and the original exception.
+    """
+
+    def __init__(self, message, snapshot=None):
+        super(ScrapeError, self).__init__(message)
+        self.snapshot = snapshot
+
+
+class PageSnapshot(object):
+    """The result of a single fetch and parse of a ScrapedPage.
+
+    All scraped attributes of a single page object share one snapshot, so
+    every field reflects the exact same response. A snapshot explicitly
+    carries the HTTP status, the final url (after redirects), the detected
+    encoding and any retrieval or parse failure.
+    """
+
+    def __init__(self, url, status_code=None, final_url=None, encoding=None,
+                 text=None, content=None, document=None, error=None):
+        self.url = url
+        self.status_code = status_code
+        self.final_url = final_url
+        self.encoding = encoding
+        self.text = text
+        self.content = content
+        self.document = document
+        self.error = error
+
+    @property
+    def ok(self):
+        """Whether this snapshot holds a usable, successfully fetched
+        document."""
+        return (self.error is None
+                and self.document is not None
+                and (self.status_code is None or self.status_code < 400))
+
+    def text_as(self, encoding):
+        """Decode the raw response content with an explicit encoding.
+
+        Useful when the server declared a wrong encoding; the detected
+        encoding is available as ``snapshot.encoding``.
+        """
+        if self.content is None:
+            return self.text
+        return self.content.decode(encoding, errors="replace")
+
+    def __repr__(self):
+        return ("%s(url=%r, status_code=%r, final_url=%r, encoding=%r, "
+                "ok=%r)" % (type(self).__name__, self.url, self.status_code,
+                            self.final_url, self.encoding, self.ok))
 
 
 class ScrapedAttribute(object):
@@ -50,12 +102,6 @@ class ScrapedAttribute(object):
             if value is None:
                 return
 
-        # In python2, lxml returns str if only ascii characters are used.
-        # This leads to inconsistent return types, so in that case, we convert
-        # to unicode (which should be a semantic no-op)
-        if six.PY2 and isinstance(value, str):  # pragma: no cover
-            value = six.text_type(value)
-
         return self.perform_cleanups(value, element, scraped_page)
 
     def perform_cleanups(self, value, element, scraped_page=None):
@@ -73,6 +119,7 @@ class ScrapedAttribute(object):
     def __call__(self, func):
         self._cleanup_method = func
         return self
+
 
 _SCRAPER_CLASSES = {}
 
@@ -100,13 +147,15 @@ class _ScrapedMeta(type):
         return result
 
 
-@six.add_metaclass(_ScrapedMeta)
-class ScrapedPage(object):
-    _scrape_doc = None
+class ScrapedPage(object, metaclass=_ScrapedMeta):
     scrape_url = None
     scrape_args = []
     scrape_arg_defaults = {}
     scrape_headers = {}
+
+    # Whether a HTTP error status (>= 400) should fail attribute access.
+    # When disabled, error pages are scraped like any other page.
+    scrape_raise_for_status = True
 
     def __init__(self, *pargs, **kwargs):
         scrape_url = kwargs.pop("scrape_url", None)
@@ -130,23 +179,95 @@ class ScrapedPage(object):
         if scrape_referer:
             self.scrape_headers['Referer'] = scrape_referer
 
+        self._scrape_snapshot = None
+        self._scrape_session = None
+
     @property
     def scrape_session(self):
-        return SHARED_SESSION
+        # Each page object gets its own session, so cookies and other
+        # state never leak between unrelated page objects. Override this
+        # property (or scrape_create_session) to share a session.
+        if self._scrape_session is None:
+            self._scrape_session = self.scrape_create_session()
+        return self._scrape_session
+
+    def scrape_create_session(self):
+        session = requests.Session()
+        session.headers['User-Agent'] = DEFAULT_USER_AGENT
+        return session
 
     def scrape_fetch(self, url):
+        """Fetch the page, and return the ``requests`` response object."""
         return self.scrape_session.get(url,
-                                       headers=self.scrape_headers).text
+                                       headers=self.scrape_headers)
 
     def scrape_create_document(self, page):
         return lxml.html.fromstring(page)
 
-    def _get_value(self, property_scraper):
-        if self._scrape_doc is None:
-            page = self.scrape_fetch(self.scrape_url)
-            self._scrape_doc = self.scrape_create_document(page)
+    def scrape_create_snapshot(self, response):
+        """Build a PageSnapshot from a fetched response."""
+        document = None
+        error = None
+        try:
+            document = self.scrape_create_document(response.text)
+        except Exception as exc:
+            error = exc
 
-        return property_scraper.get(self._scrape_doc, scraped_page=self)
+        return PageSnapshot(
+            url=self.scrape_url,
+            status_code=response.status_code,
+            final_url=response.url,
+            encoding=response.encoding or response.apparent_encoding,
+            text=response.text,
+            content=response.content,
+            document=document,
+            error=error)
+
+    @property
+    def scrape_snapshot(self):
+        """The snapshot all scraped attributes of this object operate on.
+
+        The page is fetched lazily on first access; from then on, every
+        attribute shares this exact snapshot.
+        """
+        if self._scrape_snapshot is None:
+            self._scrape_snapshot = self._scrape_fetch_snapshot()
+        return self._scrape_snapshot
+
+    def _scrape_fetch_snapshot(self):
+        try:
+            response = self.scrape_fetch(self.scrape_url)
+        except Exception as exc:
+            return PageSnapshot(url=self.scrape_url, error=exc)
+        return self.scrape_create_snapshot(response)
+
+    def scrape_retry(self):
+        """Discard the current snapshot and fetch the page again.
+
+        Returns the new snapshot. Use this to recover from a failed
+        snapshot (``snapshot.ok`` is False).
+        """
+        self._scrape_snapshot = None
+        return self.scrape_snapshot
+
+    def _get_value(self, property_scraper):
+        snapshot = self.scrape_snapshot
+
+        if snapshot.error is not None:
+            raise ScrapeError(
+                "Failed to retrieve %s: %s" % (self.scrape_url,
+                                               snapshot.error),
+                snapshot=snapshot)
+
+        if (self.scrape_raise_for_status
+                and snapshot.status_code is not None
+                and snapshot.status_code >= 400):
+            raise ScrapeError(
+                "HTTP status %s while retrieving %s" % (
+                    snapshot.status_code, self.scrape_url),
+                snapshot=snapshot)
+
+        return property_scraper.get(snapshot.document, scraped_page=self)
 
     @property
     def _dict(self):
@@ -225,9 +346,9 @@ class CssRaw(Css):
         if self.include_tag:
             value = lxml.html.tostring(element, encoding="unicode")
         else:
-            value = six.text_type("")
+            value = ""
             if element.text:
-                value = cgi.escape(element.text)
+                value = escape(element.text, quote=False)
             for child in element:
                 value += lxml.html.tostring(child, encoding="unicode")
 
@@ -307,13 +428,17 @@ class CssLink(Css):
         self.referer = referer
 
     def cleanup(self, value, elements, scraped_page=None):
-        url = urlparse.urljoin(scraped_page.scrape_url, value)
+        # Resolve relative links against the final url of the snapshot,
+        # so redirects are taken into account.
+        base_url = (scraped_page.scrape_snapshot.final_url
+                    or scraped_page.scrape_url)
+        url = urlparse.urljoin(base_url, value)
         factory = (_SCRAPER_CLASSES[self.page_factory]
-                   if isinstance(self.page_factory, six.string_types)
+                   if isinstance(self.page_factory, str)
                    else self.page_factory)
 
         if self.referer is True:  # automatic referer
-            referer = scraped_page.scrape_url
+            referer = base_url
         elif not self.referer:
             referer = None
         else:

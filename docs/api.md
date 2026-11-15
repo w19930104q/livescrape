@@ -22,11 +22,27 @@ Defines additional headers to be sent. You may, for example, want to modify the 
 
 ### scrape_fetch(self, url)
 
-Fetches the raw HTML for the `ScrapedPage`. In many cases, you'll want to customize your HTTP access, for example to add caching, throttling or authentication. To do that, override the `scrape_fetch(url)` method, and add your logic there. You'll need to return a unicode string with the raw HTML. Any character encodings should already have been applied.
+Fetches the page for the `ScrapedPage`, and returns a `requests` response object. In many cases, you'll want to customize your HTTP access, for example to add caching, throttling or authentication. To do that, override the `scrape_fetch(url)` method, and add your logic there.
+
+### scrape_create_snapshot(self, response)
+
+Builds a `PageSnapshot` from the fetched response. The default implementation records the status code, final url and encoding, and parses `response.text` into a document; any parse exception is captured on the snapshot instead of being raised. Override this if you need custom decoding or snapshot handling.
 
 ### scrape_create_document(self, raw_html)
 
 Creates a lxml document from the raw html. Sometimes, your document isn't actually HTML, it may have been encoded in some form. In that case, you can override this.
+
+### scrape_snapshot
+
+The `PageSnapshot` all scraped attributes of this object operate on. The page is fetched lazily on first access; from then on, every attribute shares the same snapshot, so all fields reflect a single response.
+
+### scrape_retry(self)
+
+Discards the current snapshot and fetches the page again, returning the new snapshot. Use this to recover when `scrape_snapshot.ok` is `False`.
+
+### scrape_raise_for_status
+
+Class attribute, `True` by default. When enabled, accessing a scraped attribute raises `ScrapeError` if the snapshot has a HTTP error status (>= 400). Set it to `False` to scrape error pages like any other page.
 
 ### _dict
 
@@ -38,7 +54,7 @@ A list of all the scrapable attributes. Automatically generated.
 
 ### scrape_session
 
-By default this property returns the session shared by all the `ScrapedPage` classes, but individual classes can override according to their needs. The original shared session can be found in `livescrape.SHARED_SESSION`.
+Each `ScrapedPage` object gets its own `requests` session (created lazily by `scrape_create_session`), so cookies and other connection state never leak between unrelated page objects. If you need a custom or shared session, override the `scrape_session` property or `scrape_create_session` to provide your own one.
 
 ## ScrapedAttribute(extract=None, cleanup=None, attribute=None, multiple=False)
 
@@ -114,9 +130,24 @@ Finds links in the document using `selector`, and returns a new `ScrapedPage` fo
 
 If `referer` is True, the Referer header is set up automatically. You can also set it to a custom url, or to False (for no referer header).
 
-# SHARED_SESSION
+# PageSnapshot
 
-All of the `ScapedPage` descendents share a [requests](http://docs.python-requests.org/) session. In the classes this is exposed in an overridable `scrape_session` property. It may be tempting to change things in the shared session, such as user agent, however, as with any global variable, this is a bad idea. Libraries using livescrape may depend on the default values, and may break when you change them. If you need a custom session, it is best to override the `scrape_session` property to provide your own one.
+A `PageSnapshot` is the result of a single fetch and parse of a `ScrapedPage`. It carries:
+
+- `url`: the requested url
+- `status_code`: the HTTP status code of the response
+- `final_url`: the final url after any redirects
+- `encoding`: the detected or declared response encoding
+- `text` / `content`: the decoded response text and the raw response bytes
+- `document`: the parsed lxml document, or `None` if parsing failed
+- `error`: the retrieval or parse exception, or `None`
+- `ok`: whether the snapshot holds a usable, successfully fetched document
+
+`snapshot.text_as(encoding)` re-decodes the raw content with an explicit encoding, which is useful when the server declared a wrong one.
+
+# ScrapeError
+
+Raised when accessing a scraped attribute whose snapshot failed (a fetch or parse error, or a HTTP error status while `scrape_raise_for_status` is enabled). The failing snapshot is available as `exception.snapshot`. Call `scrape_retry()` on the page to fetch it again.
 
 Forward compatibility
 =====================
